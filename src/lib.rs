@@ -19,9 +19,10 @@ use std::sync::Mutex;
 
 use dashmap::DashMap;
 use easytier::{
-    common::config::{ConfigFileControl, ConfigLoader as _, TomlConfigLoader},
+    common::config::{ConfigFileControl, ConfigLoader as _, Flags, TomlConfigLoader},
     instance_manager::NetworkInstanceManager,
 };
+use std::net::Ipv4Addr;
 use once_cell::sync::Lazy;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -123,7 +124,86 @@ fn get_instance_id() -> Option<uuid::Uuid> {
         .map(|entry| *entry.value())
 }
 
-// ── 新版 C FFI（对齐参考项目 easytier_ios.h）──────────────────────────────
+// ── 安全策略 (全局代理/翻墙防护) ───────────────────────────────────────────
+//
+// EasyTier Core (v2.6.4) 在 TOML 中暴露了若干可作为公网出口/全局代理的开关，
+// 本应用定位为内网组网工具，因此必须在 Rust 胶水层强制覆写，防止用户通过
+// 越狱后篡改 App Group 中的 vpn_config 绕过分流约束。
+//
+// 覆写项参见各 setter 调用。覆写发生在 TOML 解析之后、run_network_instance 之前。
+fn sanitize_config(cfg: &TomlConfigLoader) {
+    // 1. 强制覆写危险 flags
+    let mut flags: Flags = cfg.get_flags();
+    flags.enable_exit_node = false; // 禁止本机作为出口节点
+    flags.proxy_forward_by_system = false; // 禁止通过系统栈转发到公网
+    flags.accept_dns = false; // 禁止接管 DNS，避免 DNS 逃逸/污染
+    flags.enable_ipv6 = false; // 禁用 IPv6 隧道，避免 IPv6 路径绕过分流
+    flags.relay_all_peer_rpc = false; // 禁止中继全部 RPC，限制为仅转发内网流量
+    flags.p2p_only = false; // 不允许仅 P2P 模式（防止本机仅作代理中转）
+    cfg.set_flags(flags);
+
+    // 2. 清空 exit_nodes，禁止把本机流量转发到指定 peer 出口
+    cfg.set_exit_nodes(Vec::new());
+
+    // 3. 清空 manual routes，强制走 peer 动态下发的 proxy_cidrs + iOS 侧私网过滤
+    cfg.set_routes(None);
+
+    // 4. 关闭 SOCKS5 portal，防止被当作 SOCKS5 代理对外服务
+    cfg.set_socks5_portal(None);
+
+    // 5. 关闭端口转发，防止把公网流量搬运到内网/反之
+    cfg.set_port_forwards(Vec::new());
+
+    // 6. 过滤 proxy_cidrs，仅保留私网网段；丢弃任何公网代理网段
+    let proxy_cidrs = cfg.get_proxy_cidrs();
+    if !proxy_cidrs.is_empty() {
+        cfg.clear_proxy_cidrs();
+        for p in proxy_cidrs {
+            let first_addr: Ipv4Addr = p.cidr.first_address();
+            if is_private_ipv4_addr(first_addr) {
+                let _ = cfg.add_proxy_cidr(p.cidr, p.mapped_cidr);
+            } else {
+                tracing::warn!(
+                    cidr = %p.cidr,
+                    "dropped non-private proxy_cidr due to split-tunneling policy"
+                );
+            }
+        }
+    }
+
+    // 7. vpn_portal_config（WireGuard 接入）会对外暴露一个 client_cidr，
+    //    可能被外部 WireGuard 客户端用作全局出口。ConfigLoader 未提供独立的
+    //    disable 接口，这里若用户已配置则强制只监听回环，避免外部客户端接入。
+    if let Some(mut portal) = cfg.get_vpn_portal_config() {
+        if let Ok(loopback) = "127.0.0.1:0".parse() {
+            portal.wireguard_listen = loopback;
+            cfg.set_vpn_portal_config(portal);
+        }
+    }
+}
+
+/// 判断一个 IPv4 地址是否属于私网地址段（含 CGNAT 100.64.0.0/10）。
+/// 与 iOS 侧 PacketTunnelProvider.isPrivateIPv4 保持一致的白名单口径。
+fn is_private_ipv4_addr(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    // 10.0.0.0/8
+    if octets[0] == 10 {
+        return true;
+    }
+    // 172.16.0.0/12
+    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        return true;
+    }
+    // 192.168.0.0/16
+    if octets[0] == 192 && octets[1] == 168 {
+        return true;
+    }
+    // 100.64.0.0/10 (Carrier-grade NAT)
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        return true;
+    }
+    false
+}
 
 /// # Safety
 /// Initialize logger with file path, level, and os_log subsystem.
@@ -163,6 +243,11 @@ pub unsafe extern "C" fn run_network_instance(
             return -1;
         }
     };
+
+    // 安全策略：禁用全局代理相关能力，防止被用作翻墙/出口节点/端口转发等用途。
+    // 该覆写优先于用户 TOML 中的任何字段，确保即使越狱用户篡改 App Group 中的
+    // vpn_config 也无法绕过分流约束。
+    sanitize_config(&cfg);
 
     let inst_name = cfg.get_inst_name();
 
