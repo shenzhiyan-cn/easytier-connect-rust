@@ -3,12 +3,11 @@
 # ___chkstk_darwin 符号需要 iOS 16+，否则链接会失败
 # 通过 [env] 段设置 IPHONEOS_DEPLOYMENT_TARGET，让 cc crate 编译 C 依赖时使用正确目标
 #
-# PROTOC 使用绝对路径，确保 Xcode 直接构建时（不继承 shell PATH）
-# cargokit 运行 cargo build 仍能找到 protoc，避免 prost-wkt-types build.rs 失败。
+# 确保 cargokit 构建时能找到 protoc，避免 prost-wkt-types build.rs 失败。
 
 [env]
 IPHONEOS_DEPLOYMENT_TARGET = "26.0"
-PROTOC = "/Users/guilianglei/.local/bin/protoc"
+PROTOC = "protoc"
 
 [target.aarch64-apple-ios]
 rustflags = ["-C", "link-arg=-mios-version-min=26.0"]

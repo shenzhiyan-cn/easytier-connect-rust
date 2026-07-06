@@ -124,11 +124,11 @@ fn get_instance_id() -> Option<uuid::Uuid> {
         .map(|entry| *entry.value())
 }
 
-// ── 安全策略 (全局代理/翻墙防护) ───────────────────────────────────────────
+// ── 安全策略 (全局代理/公网出口防护) ─────────────────────────────────────────
 //
 // EasyTier Core (v2.6.4) 在 TOML 中暴露了若干可作为公网出口/全局代理的开关，
-// 本应用定位为内网组网工具，因此必须在 Rust 胶水层强制覆写，防止用户通过
-// 越狱后篡改 App Group 中的 vpn_config 绕过分流约束。
+// 本应用定位为内网组网工具，因此必须在 Rust 胶水层强制覆写，防止外部传入的
+// vpn_config 绕过分流约束。
 //
 // 覆写项参见各 setter 调用。覆写发生在 TOML 解析之后、run_network_instance 之前。
 fn sanitize_config(cfg: &TomlConfigLoader) {
@@ -244,8 +244,8 @@ pub unsafe extern "C" fn run_network_instance(
         }
     };
 
-    // 安全策略：禁用全局代理相关能力，防止被用作翻墙/出口节点/端口转发等用途。
-    // 该覆写优先于用户 TOML 中的任何字段，确保即使越狱用户篡改 App Group 中的
+    // 安全策略：禁用全局代理相关能力，防止被用作公网出口节点/端口转发等用途。
+    // 该覆写优先于用户 TOML 中的任何字段，确保即使调用方篡改 App Group 中的
     // vpn_config 也无法绕过分流约束。
     sanitize_config(&cfg);
 

@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-# 仅编译为动态库（cdylib），以满足 LGPL v3.0 合规要求。
-# EasyTier 作为 LGPL-3.0 库，必须以动态链接方式使用，自有代码方可保持闭源。
-crate-type = ["cdylib"]
+# 同时编译为动态库（cdylib）与静态库（staticlib）。
+# - cdylib：CocoaPods 在 use_frameworks! 模式下将 Rust 编译产物封装为
+#   dynamic framework（MH_DYLIB），运行时由 dyld 通过 LC_LOAD_DYLIB 加载，
+#   满足 LGPL v3.0 §4d1 "合适的共享库机制" 合规要求。
+# - staticlib：作为本地链接 fallback，便于 cargo / 单元测试等场景使用。
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 easytier = { git = "https://github.com/EasyTier/EasyTier", tag = "v2.6.4", version = "2.6.4" }
