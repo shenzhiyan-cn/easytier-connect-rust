@@ -1,5 +1,5 @@
 [package]
-name = "rust_lib_easytier_connect_flutter"
+name = "rust_lib_easytier_connect"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,6 +14,12 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 easytier = { git = "https://github.com/EasyTier/EasyTier", tag = "v2.6.4", version = "2.6.4" }
 flutter_rust_bridge = "=2.12.0"
+
+# 状态查询专用 runtime：显式 current_thread，避免 easytier 内部
+# `collect_network_infos_sync()` 每次 `Runtime::new()`（默认 worker_threads =
+# `available_parallelism()`）在 Android 上探测 /sys/fs/cgroup 触发
+# SELinux avc denied 审计日志。features 与 easytier 依赖 union 后全量可用。
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "time", "sync"] }
 
 # C FFI 依赖
 dashmap = "6.0"

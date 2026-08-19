@@ -1,26 +1,37 @@
+use crate::{
+    collect_network_infos_inner, get_core_logs_inner, get_latest_error_msg_inner,
+    parse_config_inner, run_network_instance_inner, set_tun_fd_inner, stop_network_instance_inner,
+};
+
 #[flutter_rust_bridge::frb(sync)] // Synchronous mode for simple calls
 pub fn parse_config(config_str: String) -> String {
-    // TODO: Call easytier-ffi parse_config
-    format!("Parsed: {}", config_str)
+    match parse_config_inner(&config_str) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e,
+    }
 }
 
 pub fn run_network_instance(config_json: String) -> bool {
-    // TODO: Call easytier-ffi run_network_instance
-    true
+    run_network_instance_inner(&config_json).is_ok()
 }
 
 pub fn set_tun_fd(fd: i32) -> bool {
-    // TODO: Call easytier-ffi set_tun_fd
-    true
+    set_tun_fd_inner(fd).is_ok()
+}
+
+pub fn stop_network_instance() -> bool {
+    stop_network_instance_inner().is_ok()
 }
 
 pub fn collect_network_infos() -> String {
-    // TODO: Call easytier-ffi collect_network_infos
-    "{}".to_string()
+    collect_network_infos_inner().unwrap_or_else(|_| "{}".to_string())
+}
+
+pub fn get_latest_error_msg() -> String {
+    get_latest_error_msg_inner().unwrap_or_default()
 }
 
 // Log rotation/export
 pub fn get_core_logs() -> String {
-    // TODO: Implement log collection for iOS memory constraints
-    "[]".to_string()
+    get_core_logs_inner()
 }

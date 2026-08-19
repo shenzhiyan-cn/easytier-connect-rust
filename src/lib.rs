@@ -33,6 +33,17 @@ static INSTANCE_NAME_ID_MAP: Lazy<DashMap<String, uuid::Uuid>> =
 static INSTANCE_MANAGER: Lazy<NetworkInstanceManager> =
     Lazy::new(NetworkInstanceManager::new);
 
+// 状态查询专用 runtime：显式 current_thread，避免 easytier 内部
+// `collect_network_infos_sync()` 每次 `Runtime::new()`（默认 worker_threads =
+// `available_parallelism()`）在 Android 上探测 /sys/fs/cgroup 触发
+// SELinux avc denied 审计日志。
+static QUERY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build query runtime")
+});
+
 static ERROR_MSG: Lazy<Mutex<Vec<u8>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 // 全局 stop 标志，用于 stop_network_instance
@@ -140,6 +151,10 @@ fn sanitize_config(cfg: &TomlConfigLoader) {
     flags.enable_ipv6 = false; // 禁用 IPv6 隧道，避免 IPv6 路径绕过分流
     flags.relay_all_peer_rpc = false; // 禁止中继全部 RPC，限制为仅转发内网流量
     flags.p2p_only = false; // 不允许仅 P2P 模式（防止本机仅作代理中转）
+    // 单线程异步运行时：core 内 QuicEndpointManager 仅在 multi_thread 下调用
+    // available_parallelism()（探测 /sys/fs/cgroup 触发 Android SELinux 审计日志），
+    // 移动端场景单线程事件循环无性能影响。
+    flags.multi_thread = false;
     cfg.set_flags(flags);
 
     // 2. 清空 exit_nodes，禁止把本机流量转发到指定 peer 出口
@@ -205,14 +220,122 @@ fn is_private_ipv4_addr(addr: Ipv4Addr) -> bool {
     false
 }
 
+// ── 内部实现（C FFI 与 frb API 共用）───────────────────────────────────────
+//
+// C FFI 层（iOS Network Extension 经 Bridging Header 调用）与 Dart 侧
+// flutter_rust_bridge API（`crate::api::easytier_api`）共用同一套核心逻辑，
+// 避免两套实现漂移。C FFI 函数仅做指针/错误消息的桥接，真正的行为在此处。
+
+pub(crate) fn parse_config_inner(config_str: &str) -> Result<(), String> {
+    TomlConfigLoader::new_from_str(config_str)
+        .map(|_| ())
+        .map_err(|e| format!("failed to parse config: {:?}", e))
+}
+
+pub(crate) fn run_network_instance_inner(cfg_str: &str) -> Result<(), String> {
+    let cfg = TomlConfigLoader::new_from_str(cfg_str)
+        .map_err(|e| format!("failed to parse config: {}", e))?;
+
+    // 安全策略：禁用全局代理相关能力，防止被用作公网出口节点/端口转发等用途。
+    // 该覆写优先于用户 TOML 中的任何字段，确保即使调用方篡改 vpn_config
+    // 也无法绕过分流约束。
+    sanitize_config(&cfg);
+
+    let inst_name = cfg.get_inst_name();
+
+    init_log_subscriber();
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+
+    if INSTANCE_NAME_ID_MAP.contains_key(&inst_name) {
+        return Err("instance already exists".to_string());
+    }
+
+    let instance_id = INSTANCE_MANAGER
+        .run_network_instance(cfg, false, ConfigFileControl::STATIC_CONFIG)
+        .map_err(|e| format!("failed to start instance: {}", e))?;
+
+    INSTANCE_NAME_ID_MAP.insert(inst_name, instance_id);
+    Ok(())
+}
+
+pub(crate) fn stop_network_instance_inner() -> Result<(), String> {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+    INSTANCE_MANAGER
+        .retain_network_instance(Vec::new())
+        .map_err(|e| format!("failed to stop instances: {}", e))?;
+    INSTANCE_NAME_ID_MAP.clear();
+    Ok(())
+}
+
+pub(crate) fn set_tun_fd_inner(fd: i32) -> Result<(), String> {
+    let inst_id = get_instance_id().ok_or_else(|| "no running instance".to_string())?;
+    INSTANCE_MANAGER
+        .set_tun_fd(&inst_id, fd)
+        .map_err(|e| format!("failed to set tun fd: {}", e))
+}
+
+pub(crate) fn collect_network_infos_inner() -> Result<String, String> {
+    let collected = QUERY_RUNTIME
+        .block_on(INSTANCE_MANAGER.collect_network_infos())
+        .map_err(|e| format!("failed to collect running info: {}", e))?;
+
+    // 与 get_running_info 相同：单实例直接返回 info JSON，多实例返回数组
+    let combined: serde_json::Value = if collected.len() == 1 {
+        let info = collected.into_values().next().unwrap();
+        serde_json::to_value(&info).unwrap_or(serde_json::Value::Null)
+    } else if collected.is_empty() {
+        serde_json::Value::Null
+    } else {
+        let values: Vec<serde_json::Value> = collected
+            .into_values()
+            .filter_map(|info| serde_json::to_value(&info).ok())
+            .collect();
+        serde_json::Value::Array(values)
+    };
+
+    serde_json::to_string(&combined).map_err(|e| format!("failed to serialize: {}", e))
+}
+
+pub(crate) fn get_latest_error_msg_inner() -> Option<String> {
+    let msg_buf = ERROR_MSG.lock().unwrap();
+    if msg_buf.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&msg_buf).into_owned())
+}
+
+pub(crate) fn get_core_logs_inner() -> String {
+    let buffer = LOG_BUFFER.lock().unwrap();
+    let content = String::from_utf8_lossy(&buffer);
+
+    let entries: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .enumerate()
+        .map(|(i, line)| {
+            let (timestamp, level, rest) = parse_tracing_line(line);
+            let (target, message) = parse_target_message(&rest);
+            serde_json::json!({
+                "id": i.to_string(),
+                "timestamp": timestamp,
+                "level": level,
+                "message": message,
+                "tag": target,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// # Safety
 /// Initialize logger with file path, level, and os_log subsystem.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn init_logger(
     path: *const c_char,
-    level: *const c_char,
-    subsystem: *const c_char,
-    err_msg: *mut *const c_char,
+    _level: *const c_char,
+    _subsystem: *const c_char,
+    _err_msg: *mut *const c_char,
 ) -> i32 {
     if !path.is_null() {
         let path_str = unsafe { CStr::from_ptr(path).to_string_lossy().into_owned() };
@@ -234,80 +357,37 @@ pub unsafe extern "C" fn run_network_instance(
         assert!(!cfg_str.is_null());
         CStr::from_ptr(cfg_str).to_string_lossy().into_owned()
     };
-    let cfg = match TomlConfigLoader::new_from_str(&cfg_str) {
-        Ok(cfg) => cfg,
+    match run_network_instance_inner(&cfg_str) {
+        Ok(()) => 0,
         Err(e) => {
-            let msg = format!("failed to parse config: {}", e);
-            set_error_msg(&msg);
-            set_err_msg_ptr(err_msg, &msg);
-            return -1;
+            set_error_msg(&e);
+            set_err_msg_ptr(err_msg, &e);
+            -1
         }
-    };
-
-    // 安全策略：禁用全局代理相关能力，防止被用作公网出口节点/端口转发等用途。
-    // 该覆写优先于用户 TOML 中的任何字段，确保即使调用方篡改 App Group 中的
-    // vpn_config 也无法绕过分流约束。
-    sanitize_config(&cfg);
-
-    let inst_name = cfg.get_inst_name();
-
-    init_log_subscriber();
-    STOP_REQUESTED.store(false, Ordering::SeqCst);
-
-    if INSTANCE_NAME_ID_MAP.contains_key(&inst_name) {
-        let msg = "instance already exists";
-        set_error_msg(msg);
-        set_err_msg_ptr(err_msg, msg);
-        return -1;
     }
-
-    let instance_id =
-        match INSTANCE_MANAGER.run_network_instance(cfg, false, ConfigFileControl::STATIC_CONFIG) {
-            Ok(id) => id,
-            Err(e) => {
-                let msg = format!("failed to start instance: {}", e);
-                set_error_msg(&msg);
-                set_err_msg_ptr(err_msg, &msg);
-                return -1;
-            }
-        };
-
-    INSTANCE_NAME_ID_MAP.insert(inst_name, instance_id);
-    0
 }
 
 /// Stop the running network instance.
 #[unsafe(no_mangle)]
 pub extern "C" fn stop_network_instance() -> i32 {
-    STOP_REQUESTED.store(true, Ordering::SeqCst);
-    if let Err(e) = INSTANCE_MANAGER.retain_network_instance(Vec::new()) {
-        set_error_msg(&format!("failed to stop instances: {}", e));
-        return -1;
+    match stop_network_instance_inner() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error_msg(&e);
+            -1
+        }
     }
-    INSTANCE_NAME_ID_MAP.clear();
-    0
 }
 
 /// # Safety
 /// Set the TUN file descriptor for the running instance.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn set_tun_fd(fd: i32, err_msg: *mut *const c_char) -> i32 {
-    let inst_id = match get_instance_id() {
-        Some(id) => id,
-        None => {
-            let msg = "no running instance";
-            set_error_msg(msg);
-            set_err_msg_ptr(err_msg, msg);
-            return -1;
-        }
-    };
-
-    match INSTANCE_MANAGER.set_tun_fd(&inst_id, fd) {
-        Ok(_) => 0,
+    match set_tun_fd_inner(fd) {
+        Ok(()) => 0,
         Err(e) => {
-            let msg = format!("failed to set tun fd: {}", e);
-            set_error_msg(&msg);
-            set_err_msg_ptr(err_msg, &msg);
+            set_error_msg(&e);
+            set_err_msg_ptr(err_msg, &e);
             -1
         }
     }
@@ -318,7 +398,7 @@ pub unsafe extern "C" fn set_tun_fd(fd: i32, err_msg: *mut *const c_char) -> i32
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn register_stop_callback(
     callback: Option<unsafe extern "C" fn()>,
-    err_msg: *mut *const c_char,
+    _err_msg: *mut *const c_char,
 ) -> i32 {
     if callback.is_none() {
         return 0;
@@ -349,7 +429,7 @@ pub unsafe extern "C" fn register_stop_callback(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn register_running_info_callback(
     callback: Option<unsafe extern "C" fn()>,
-    err_msg: *mut *const c_char,
+    _err_msg: *mut *const c_char,
 ) -> i32 {
     if callback.is_none() {
         return 0;
@@ -389,34 +469,16 @@ pub unsafe extern "C" fn get_running_info(
         return -1;
     }
 
-    let collected = match INSTANCE_MANAGER.collect_network_infos_sync() {
-        Ok(infos) => infos,
+    let json_str = match collect_network_infos_inner() {
+        Ok(s) => s,
         Err(e) => {
-            let msg = format!("failed to collect running info: {}", e);
-            set_error_msg(&msg);
-            set_err_msg_ptr(err_msg, &msg);
+            set_error_msg(&e);
+            set_err_msg_ptr(err_msg, &e);
             unsafe { *json = std::ptr::null() };
             return -1;
         }
     };
 
-    // Combine all instance infos into a single JSON object
-    let combined: serde_json::Value = if collected.len() == 1 {
-        // Single instance: return its info directly
-        let info = collected.into_values().next().unwrap();
-        serde_json::to_value(&info).unwrap_or(serde_json::Value::Null)
-    } else if collected.is_empty() {
-        serde_json::Value::Null
-    } else {
-        // Multiple instances: return as array
-        let values: Vec<serde_json::Value> = collected
-            .into_values()
-            .filter_map(|info| serde_json::to_value(&info).ok())
-            .collect();
-        serde_json::Value::Array(values)
-    };
-
-    let json_str = serde_json::to_string(&combined).unwrap_or_else(|_| "{}".to_string());
     unsafe {
         *json = CString::new(json_str).unwrap().into_raw();
     }
@@ -429,19 +491,18 @@ pub unsafe extern "C" fn get_running_info(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_latest_error_msg(
     msg: *mut *const c_char,
-    err_msg: *mut *const c_char,
+    _err_msg: *mut *const c_char,
 ) -> i32 {
     if msg.is_null() {
         return -1;
     }
 
-    let msg_buf = ERROR_MSG.lock().unwrap();
-    if msg_buf.is_empty() {
+    let Some(msg_str) = get_latest_error_msg_inner() else {
         unsafe { *msg = std::ptr::null() };
         return 0;
-    }
+    };
 
-    if let Ok(cstr) = CString::new(&msg_buf[..]) {
+    if let Ok(cstr) = CString::new(msg_str) {
         unsafe {
             *msg = cstr.into_raw();
         }
@@ -473,12 +534,13 @@ pub unsafe extern "C" fn parse_config(cfg_str: *const c_char) -> i32 {
         CStr::from_ptr(cfg_str).to_string_lossy().into_owned()
     };
 
-    if let Err(e) = TomlConfigLoader::new_from_str(&cfg_str) {
-        set_error_msg(&format!("failed to parse config: {:?}", e));
-        return -1;
+    match parse_config_inner(&cfg_str) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error_msg(&e);
+            -1
+        }
     }
-
-    0
 }
 
 /// # Safety
@@ -503,27 +565,7 @@ pub unsafe extern "C" fn get_error_msg(out: *mut *const c_char) {
 /// Export core logs as JSON array.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_core_logs() -> *mut c_char {
-    let buffer = LOG_BUFFER.lock().unwrap();
-    let content = String::from_utf8_lossy(&buffer);
-
-    let entries: Vec<serde_json::Value> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .enumerate()
-        .map(|(i, line)| {
-            let (timestamp, level, rest) = parse_tracing_line(line);
-            let (target, message) = parse_target_message(&rest);
-            serde_json::json!({
-                "id": i.to_string(),
-                "timestamp": timestamp,
-                "level": level,
-                "message": message,
-                "tag": target,
-            })
-        })
-        .collect();
-
-    let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+    let json = get_core_logs_inner();
     CString::new(json).unwrap().into_raw()
 }
 
